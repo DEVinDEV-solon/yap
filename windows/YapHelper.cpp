@@ -187,30 +187,45 @@ static void cmdPaste(const char* bundleId, const char* pidStr) {
 
 static WORD targetVk = 0;
 
-// A typing key (Space, a letter, F5) must still type when it is only tapped.
-// Its press is held back; only a press longer than HOLD_MS becomes dictation,
-// a shorter one is replayed as the keystroke it was. Modifier keys type
-// nothing, so they start dictation at once and are never held back.
+// A typing key (Space, a letter, F5) must still type when it is only tapped,
+// so the helper decides what a press is before anything reaches the app:
+//
+//   hold             longer than HOLD_MS: dictation until the release
+//   double tap       hands-free dictation; the next press stops it
+//   single tap       replayed as the keystroke it was, once the double-tap
+//                    window has passed or the next key goes down
+//
+// Modifier keys type nothing, so they start dictation at once and the app
+// tells taps from holds (gesture.ts).
 static const UINT HOLD_MS = 250;
+// Matches DOUBLE_TAP_WINDOW_MS in gesture.ts.
+static const UINT DOUBLE_TAP_MS = 350;
+// The recording limit in engine.ts. A hands-free session the app ended on its
+// own is forgotten after it, so the key types again.
+static const ULONGLONG HANDSFREE_MAX_MS = 10ULL * 60 * 1000;
 // Marks the keystrokes the helper replays, so the hook lets them through.
 static const ULONG_PTR YAP_INJECTED = 0x59415021;
+
+enum TypingState {
+    TS_IDLE,
+    TS_PRESSED,         // down, hold or tap not decided yet
+    TS_HOLDING,         // held: dictating until the release
+    TS_TAPPED,          // tapped once, waiting for a second tap
+    TS_LATCHING,        // second tap still down: hands-free has started
+    TS_HANDSFREE,       // dictating hands-free, key up
+    TS_STOPPING,        // the press that stops hands-free, still down
+};
+
 static bool typingKey = false;
-static bool pressPending = false;
+static TypingState typingState = TS_IDLE;
 // The real release of a press already replayed as a tap.
 static bool swallowUp = false;
-static UINT_PTR holdTimer = 0;
+static ULONGLONG handsfreeSince = 0;
+static UINT_PTR typingTimer = 0;
 
-static void stopHoldTimer() {
-    if (holdTimer) KillTimer(NULL, holdTimer);
-    holdTimer = 0;
-}
-
-static void CALLBACK holdElapsed(HWND, UINT, UINT_PTR, DWORD) {
-    stopHoldTimer();
-    if (!pressPending) return;
-    pressPending = false;
-    hotkeyIsDown = true;
-    emitEvent("fnDown");
+static void stopTypingTimer() {
+    if (typingTimer) KillTimer(NULL, typingTimer);
+    typingTimer = 0;
 }
 
 static void fillKey(INPUT* input, WORD vk, WORD scan, DWORD flags) {
@@ -224,8 +239,8 @@ static void fillKey(INPUT* input, WORD vk, WORD scan, DWORD flags) {
 /* The held-back press was a tap: type it now. A key that arrived while it was
    held back comes after it, so fast typing keeps its order ("a b", not "ab "). */
 static void replayTap(const KBDLLHOOKSTRUCT* next) {
-    stopHoldTimer();
-    pressPending = false;
+    stopTypingTimer();
+    typingState = TS_IDLE;
     INPUT inputs[3] = {};
     UINT count = 0;
     fillKey(&inputs[count++], targetVk, 0, 0);
@@ -235,6 +250,90 @@ static void replayTap(const KBDLLHOOKSTRUCT* next) {
         fillKey(&inputs[count++], (WORD)next->vkCode, (WORD)next->scanCode, flags);
     }
     SendInput(count, inputs, sizeof(INPUT));
+}
+
+static void CALLBACK typingTimerElapsed(HWND, UINT, UINT_PTR, DWORD) {
+    stopTypingTimer();
+    if (typingState == TS_PRESSED) {
+        typingState = TS_HOLDING;
+        emitEvent("fnDown");
+    } else if (typingState == TS_TAPPED) {
+        replayTap(NULL);
+    }
+}
+
+/* Returns true when the event is swallowed. */
+static bool handleTypingKey(const KBDLLHOOKSTRUCT* kb, bool isKeyDown, bool isKeyUp) {
+    if (kb->vkCode != targetVk) {
+        if (!isKeyDown) return false;
+        // Another key while a press is held back: that press was a tap.
+        if (typingState == TS_PRESSED) {
+            replayTap(kb);
+            swallowUp = true;
+            return true;
+        }
+        if (typingState == TS_TAPPED) {
+            replayTap(kb);
+            return true;
+        }
+        return false;
+    }
+
+    if (typingState == TS_HANDSFREE && GetTickCount64() - handsfreeSince > HANDSFREE_MAX_MS)
+        typingState = TS_IDLE;
+
+    if (isKeyDown) {
+        switch (typingState) {
+        case TS_IDLE:
+            if (targetModifiers != 0 && !abstractModifiersHeld(targetModifiers)) return false;
+            typingState = TS_PRESSED;
+            swallowUp = false;
+            typingTimer = SetTimer(NULL, 0, HOLD_MS, typingTimerElapsed);
+            return true;
+        case TS_TAPPED:
+            // Replayed for the app as the double tap it understands.
+            stopTypingTimer();
+            typingState = TS_LATCHING;
+            emitEvent("fnDown");
+            emitEvent("fnUp");
+            emitEvent("fnDown");
+            return true;
+        case TS_HANDSFREE:
+            typingState = TS_STOPPING;
+            emitEvent("fnDown");
+            return true;
+        default:
+            // Auto-repeat while a press is held back or dictating types nothing.
+            return true;
+        }
+    }
+
+    if (isKeyUp) {
+        switch (typingState) {
+        case TS_PRESSED:
+            stopTypingTimer();
+            typingState = TS_TAPPED;
+            typingTimer = SetTimer(NULL, 0, DOUBLE_TAP_MS, typingTimerElapsed);
+            return true;
+        case TS_HOLDING:
+        case TS_STOPPING:
+            typingState = TS_IDLE;
+            emitEvent("fnUp");
+            return true;
+        case TS_LATCHING:
+            typingState = TS_HANDSFREE;
+            handsfreeSince = GetTickCount64();
+            emitEvent("fnUp");
+            return true;
+        default:
+            if (swallowUp) {
+                swallowUp = false;
+                return true;
+            }
+            return false;
+        }
+    }
+    return false;
 }
 
 static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
@@ -247,40 +346,7 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
     if (kb->dwExtraInfo == YAP_INJECTED) return CallNextHookEx(NULL, nCode, wParam, lParam);
 
     if (typingKey) {
-        if (kb->vkCode != targetVk) {
-            // Another key while the press is held back: it was a tap.
-            if (pressPending && isKeyDown) {
-                replayTap(kb);
-                swallowUp = true;
-                return 1;
-            }
-            return CallNextHookEx(NULL, nCode, wParam, lParam);
-        }
-        if (isKeyDown) {
-            // Auto-repeat while held back or dictating types nothing.
-            if (pressPending || hotkeyIsDown) return 1;
-            if (targetModifiers != 0 && !abstractModifiersHeld(targetModifiers))
-                return CallNextHookEx(NULL, nCode, wParam, lParam);
-            pressPending = true;
-            swallowUp = false;
-            holdTimer = SetTimer(NULL, 0, HOLD_MS, holdElapsed);
-            return 1;
-        }
-        if (isKeyUp) {
-            if (pressPending) {
-                replayTap(NULL);
-                return 1;
-            }
-            if (hotkeyIsDown) {
-                hotkeyIsDown = false;
-                emitEvent("fnUp");
-                return 1;
-            }
-            if (swallowUp) {
-                swallowUp = false;
-                return 1;
-            }
-        }
+        if (handleTypingKey(kb, isKeyDown, isKeyUp)) return 1;
         return CallNextHookEx(NULL, nCode, wParam, lParam);
     }
 
