@@ -187,12 +187,102 @@ static void cmdPaste(const char* bundleId, const char* pidStr) {
 
 static WORD targetVk = 0;
 
+// A typing key (Space, a letter, F5) must still type when it is only tapped.
+// Its press is held back; only a press longer than HOLD_MS becomes dictation,
+// a shorter one is replayed as the keystroke it was. Modifier keys type
+// nothing, so they start dictation at once and are never held back.
+static const UINT HOLD_MS = 250;
+// Marks the keystrokes the helper replays, so the hook lets them through.
+static const ULONG_PTR YAP_INJECTED = 0x59415021;
+static bool typingKey = false;
+static bool pressPending = false;
+// The real release of a press already replayed as a tap.
+static bool swallowUp = false;
+static UINT_PTR holdTimer = 0;
+
+static void stopHoldTimer() {
+    if (holdTimer) KillTimer(NULL, holdTimer);
+    holdTimer = 0;
+}
+
+static void CALLBACK holdElapsed(HWND, UINT, UINT_PTR, DWORD) {
+    stopHoldTimer();
+    if (!pressPending) return;
+    pressPending = false;
+    hotkeyIsDown = true;
+    emitEvent("fnDown");
+}
+
+static void fillKey(INPUT* input, WORD vk, WORD scan, DWORD flags) {
+    input->type = INPUT_KEYBOARD;
+    input->ki.wVk = vk;
+    input->ki.wScan = scan;
+    input->ki.dwFlags = flags;
+    input->ki.dwExtraInfo = YAP_INJECTED;
+}
+
+/* The held-back press was a tap: type it now. A key that arrived while it was
+   held back comes after it, so fast typing keeps its order ("a b", not "ab "). */
+static void replayTap(const KBDLLHOOKSTRUCT* next) {
+    stopHoldTimer();
+    pressPending = false;
+    INPUT inputs[3] = {};
+    UINT count = 0;
+    fillKey(&inputs[count++], targetVk, 0, 0);
+    fillKey(&inputs[count++], targetVk, 0, KEYEVENTF_KEYUP);
+    if (next) {
+        DWORD flags = (next->flags & LLKHF_EXTENDED) ? KEYEVENTF_EXTENDEDKEY : 0;
+        fillKey(&inputs[count++], (WORD)next->vkCode, (WORD)next->scanCode, flags);
+    }
+    SendInput(count, inputs, sizeof(INPUT));
+}
+
 static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
     if (nCode != HC_ACTION) return CallNextHookEx(NULL, nCode, wParam, lParam);
 
     KBDLLHOOKSTRUCT* kb = (KBDLLHOOKSTRUCT*)lParam;
     bool isKeyDown = (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN);
     bool isKeyUp   = (wParam == WM_KEYUP   || wParam == WM_SYSKEYUP);
+
+    if (kb->dwExtraInfo == YAP_INJECTED) return CallNextHookEx(NULL, nCode, wParam, lParam);
+
+    if (typingKey) {
+        if (kb->vkCode != targetVk) {
+            // Another key while the press is held back: it was a tap.
+            if (pressPending && isKeyDown) {
+                replayTap(kb);
+                swallowUp = true;
+                return 1;
+            }
+            return CallNextHookEx(NULL, nCode, wParam, lParam);
+        }
+        if (isKeyDown) {
+            // Auto-repeat while held back or dictating types nothing.
+            if (pressPending || hotkeyIsDown) return 1;
+            if (targetModifiers != 0 && !abstractModifiersHeld(targetModifiers))
+                return CallNextHookEx(NULL, nCode, wParam, lParam);
+            pressPending = true;
+            swallowUp = false;
+            holdTimer = SetTimer(NULL, 0, HOLD_MS, holdElapsed);
+            return 1;
+        }
+        if (isKeyUp) {
+            if (pressPending) {
+                replayTap(NULL);
+                return 1;
+            }
+            if (hotkeyIsDown) {
+                hotkeyIsDown = false;
+                emitEvent("fnUp");
+                return 1;
+            }
+            if (swallowUp) {
+                swallowUp = false;
+                return 1;
+            }
+        }
+        return CallNextHookEx(NULL, nCode, wParam, lParam);
+    }
 
     if (kb->vkCode != targetVk) return CallNextHookEx(NULL, nCode, wParam, lParam);
 
@@ -223,6 +313,7 @@ static int cmdListen(int keyCode, int modifiers) {
         emitError("Unsupported key code for Windows.");
         return 1;
     }
+    typingKey = !isModifierKey(keyCode);
 
     HHOOK hook = SetWindowsHookExW(WH_KEYBOARD_LL, LowLevelKeyboardProc, NULL, 0);
     if (!hook) {
